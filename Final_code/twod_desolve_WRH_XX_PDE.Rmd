@@ -1,0 +1,280 @@
+---
+title: "2D monod model with deSolve"
+author: "WRH and XX, adapted from Chacon et al (2018)"
+date: "2024-03-28"
+output: rmarkdown::github_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(deSolve)
+library(tidyverse)
+```
+
+## two-dimensional simulation of a monod model
+```{r spatial_extent}
+# We make a square, 3cm x 3cm, with 30 boxes per side
+fullwidth = 3 # cm
+N = fullwidth*10   # boxes
+dx = fullwidth/N# boxwidth (cm)
+NN = N * N # total # of boxes
+```
+
+We will also define the diffusion rates of methionine, acetate, and lactose, as this is how these "state variables" will spread between boxes.
+
+```{r diffusion_parms}
+D_lactose = 0.05   
+D_acetate = 0.05 
+D_methionine = 0.01 #We estimated slower diffusion rate for methionine as in Ma et al. (2005) and Hazarika et al. (2006)
+
+#Bacteria do not diffuse
+D_ecoli = 0 #D_lactose / 50
+D_salmonella = 0# D_lactose / 50
+```
+
+Now we will make the function which deSolve uses to solve this pde. What has to happen first, though, is convert vectors of cells and nutrient concentrations to matrices. Then after the reaction part is calculated, the diffusion part is calculated using the matrices. Finally, the matrices are converted back into vectors; this may seem arcane but it is required by deSolve.
+
+Note that in the function definition, in addition to the usual arguments (time, state, pars), we are also explicitly supplying the spatial parameters (N, D_lactose, dx). 
+
+Note that a diffusion calculation on a lattice subtracts 4*the concentration of the focal box, and adds the concentration of each adjacent box, and to make this spatially realistic it does it proportional to the diffusion constant, and to 1/(dx^2). Hopefully this helps explain the diffusion calculations which occur after the reaction. 
+
+```{r 2dmonod}
+monod2D <- function (time, state, pars, N, D_ecoli, D_lactose, D_salmonella, D_methionine, D_acetate, dx) {
+  # this function needs to return a vector of data, not a matrix. That means,
+  # each time, the data must be put back into matrix form to do reaction (growth)
+  # and diffusion, then put back into vector form. Here we grab the state variables
+  # from "state" and separate them into the two different matrices
+  NN <- N*N
+  ecoli <- matrix(nrow = N, ncol = N,state[1:NN])
+  lactose <- matrix(nrow = N, ncol = N,state[(NN+1):(2*NN)])
+  salmonella <- matrix(nrow = N, ncol = N,state[(2*NN+1):(3*NN)])
+  methionine <- matrix(nrow = N, ncol = N,state[(3*NN+1):(4*NN)])
+  acetate <- matrix(nrow = N, ncol = N,state[(4*NN+1):(5*NN)])
+  
+  
+  # a check, in case of numerical issues. this is good practice for anything which can approach zero, but shouldn't go negative. This can happen to the ecoli because of diffusion. it happens to the nutrient mostly, because of consumption.
+    ecoli[ecoli < 0] = 0
+    lactose[lactose < 0] = 0
+    salmonella[salmonella < 0] = 0
+    methionine[methionine < 0] = 0
+    acetate[acetate < 0] = 0
+
+  
+  with (as.list(pars), {
+    ## the "reaction" still happens the same way, since the math is vectorized
+    decoli_dt = ecoli * vmaxE * (lactose / (lactose + kmL))*(methionine / (methionine + kmM)) - kappaEco * ecoli
+    
+    dlactose_dt = -c_E_lac*(ecoli * vmaxE * (lactose / (lactose + kmL))* (methionine / (methionine + kmM))) - kappaLac * lactose
+ 
+    dsalmonella_dt = salmonella * vmaxS * (acetate / (acetate + kmA)) - kappaSal * salmonella
+    
+    dmethionine_dt = p_met*(salmonella * vmaxS * (acetate / (acetate + kmA))) - c_E_met*(ecoli * vmaxE * (lactose / (lactose + kmL))* (methionine / (methionine + kmM))) - kappaMet * methionine
+       
+    dacetate_dt = p_ac*(ecoli * vmaxE * (lactose / (lactose + kmL))* (methionine / (methionine + kmM))) - c_S_ac *(salmonella * vmaxS * (acetate / (acetate + kmA))) - kappaAce * acetate
+    
+    
+    # next set of equations does the diffusion calculations
+
+    # if you imagine data like this:   c(1,3,2,4). Focus on the 3. It changes due to 
+    # diffusion in one axis by adding the data on both sides, then subtracting 2x of the focal.
+    # so that "3" changes like:  +1 + 2 -3 -3.  Then, this value is made spatially accurate
+    # by multiplying by D/(dx^2)
+    #
+    # in practice its slightly trickier, because the edges should reflect. We deal
+    # with this by adding a copied row above and below before performing that calculation.
+    ecoli_rows_bigger = rbind(ecoli[1,], ecoli, ecoli[N,])
+    ecoli_rows_diff = ecoli_rows_bigger[1:N,] + ecoli_rows_bigger[3:(N+2),] - 2 * ecoli
+    ecoli_rows_diff = D_ecoli * (1 / dx^2) * ecoli_rows_diff
+
+    lactose_rows_bigger = rbind(lactose[1,], lactose, lactose[N,])
+    lactose_rows_diff = lactose_rows_bigger[1:N,] + lactose_rows_bigger[3:(N+2),] - 2 * lactose
+    lactose_rows_diff = D_lactose * (1 / dx^2) * lactose_rows_diff
+    
+    salmonella_rows_bigger = rbind(salmonella[1,], salmonella, salmonella[N,])
+    salmonella_rows_diff = salmonella_rows_bigger[1:N,] + salmonella_rows_bigger[3:(N+2),] - 2 * salmonella
+    salmonella_rows_diff = D_salmonella * (1 / dx^2) * salmonella_rows_diff
+
+    methionine_rows_bigger = rbind(methionine[1,], methionine, methionine[N,])
+    methionine_rows_diff = methionine_rows_bigger[1:N,] + methionine_rows_bigger[3:(N+2),] - 2 * methionine
+    methionine_rows_diff = D_methionine * (1 / dx^2) * methionine_rows_diff
+    
+    acetate_rows_bigger = rbind(acetate[1,], acetate, acetate[N,])
+    acetate_rows_diff = acetate_rows_bigger[1:N,] + acetate_rows_bigger[3:(N+2),] - 2 * acetate
+    acetate_rows_diff = D_acetate * (1 / dx^2) * acetate_rows_diff
+    
+    
+    
+    ## 2. Now repeat, but across columns
+    ecoli_cols_bigger = cbind(ecoli[,1], ecoli, ecoli[,N])
+    ecoli_cols_diff = ecoli_cols_bigger[,1:N] + ecoli_cols_bigger[,3:(N+2)] - 2 * ecoli
+    ecoli_cols_diff = D_ecoli * (1 / dx^2) * ecoli_cols_diff
+
+    lactose_cols_bigger = cbind(lactose[,1], lactose, lactose[,N])
+    lactose_cols_diff = lactose_cols_bigger[,1:N] + lactose_cols_bigger[,3:(N+2)] - 2 * lactose
+    lactose_cols_diff = D_lactose * (1 / dx^2) * lactose_cols_diff
+    
+    salmonella_cols_bigger = cbind(salmonella[,1], salmonella, salmonella[,N])
+    salmonella_cols_diff = salmonella_cols_bigger[,1:N] + salmonella_cols_bigger[,3:(N+2)] - 2 * salmonella
+    salmonella_cols_diff = D_salmonella * (1 / dx^2) * salmonella_cols_diff
+    
+    methionine_cols_bigger = cbind(methionine[,1], methionine, methionine[,N])
+    methionine_cols_diff = methionine_cols_bigger[,1:N] + methionine_cols_bigger[,3:(N+2)] - 2 * methionine
+    methionine_cols_diff = D_methionine * (1 / dx^2) * methionine_cols_diff
+    
+    acetate_cols_bigger = cbind(acetate[,1], acetate, acetate[,N])
+    acetate_cols_diff = acetate_cols_bigger[,1:N] + acetate_cols_bigger[,3:(N+2)] - 2 * acetate
+    acetate_cols_diff = D_acetate * (1 / dx^2) * acetate_cols_diff
+        
+    # sum the row-wise and column-wise diffusion
+    ecoli_diffusion = ecoli_rows_diff + ecoli_cols_diff
+    lactose_diffusion = lactose_rows_diff + lactose_cols_diff
+    salmonella_diffusion = salmonella_rows_diff + salmonella_cols_diff
+    methionine_diffusion = methionine_rows_diff + methionine_cols_diff
+    acetate_diffusion = acetate_rows_diff + acetate_cols_diff
+    
+    ## Add the diffusion to the reaction
+    decoli_dt   = decoli_dt + ecoli_diffusion
+    dlactose_dt = dlactose_dt + lactose_diffusion
+    dsalmonella_dt   = dsalmonella_dt + salmonella_diffusion
+    dmethionine_dt = dmethionine_dt + methionine_diffusion
+    dacetate_dt = dacetate_dt + acetate_diffusion
+    
+    
+    # reconvert the state variables back into vectors, bind them together, and return as list
+    return(list(c(as.vector(decoli_dt), as.vector(dlactose_dt), as.vector(dsalmonella_dt), as.vector(dmethionine_dt), as.vector(dacetate_dt))))
+  })
+}
+```
+
+We still set parameters in a named vector.
+
+```{r parms}
+pars = c(vmaxE   = 1,    # /hr
+         vmaxS   = 0.5,    # /hr
+          kmL = 1, # half-saturation constant lactose
+          kmM = 1, # half-saturation constant methionine
+          kmA = 1, # half-saturation constant acetate
+          p_met=1.56, #Methionine production rate from S. enterica.
+          p_ac=1.01, #Carbon production rate from E. coli. 
+          c_E_met=0.1, #Methionine consumption rate from E. coli.
+          c_E_lac=1, #Lactose consumption rate from E. coli.
+          c_S_ac=1, #Carbon consumption rate from S. enterica.
+         kappaEco=5e-9, #Degradation rate for E. coli.
+         kappaSal=5e-9, #Degradation rate for S. enterica.
+         kappaLac=5e-9, #Degradation rate for lactose.
+         kappaAce=5e-9, #Degradation rate for acetate.
+         kappaMet=5e-9) #Degradation rate for methionine.
+
+```
+
+We set the initial conditions SIMILAR to what we do for a well-mixed simulation,
+but we need NxN initial values for each "layer" (two layers- bacteria and nutrient). 
+
+We also set the times.
+
+In this example, the lactose will start off uniformly distributed, and ecoli will be rare.
+
+```{r initconditions}
+## initial conditions--need NxN for cells AND nutrient.
+# get random locs for E. coli and S. enterica at the same expected frequency as in the 1D model, which is about 20% grids have cells.
+ecoli_ini = sample(c(rep(0, 4), 100), size = N*N, replace = TRUE)
+salmonella_ini = sample(c(rep(0, 4), 100), size = N*N, replace = TRUE)
+#salmonella_ini = sample(c(rep(0, 4), 0), size = N*N, replace = TRUE)
+
+# uniform resource concentration
+lactose_ini = rep(1e3, N*N)
+methionine_ini = rep(1e-1, N*N)
+acetate_ini = rep(1e-1, N*N)
+
+# all data
+yini = c(ecoli_ini, lactose_ini, salmonella_ini, methionine_ini, acetate_ini )
+
+# 50 arbitrary time units (e.g. hours).
+times = seq(0, 50, length.out = 50)
+```
+
+Now we solve the model. Note that this uses ode.2D instead of ode. 
+
+In this example we're following deSolve's suggestion and using a Runge-Kutta based solver. We could swap this out for lsoda, but it may be slower. 
+
+NOTE: THIS TAKES ABOUT A MINUTE ON A MODERN (2022) DESKTOP
+
+In the call, notice that we supply "dimens" and "nspec". The dimens are the spatial dimensions, nspec is how many "layers" (here, 2, one for ecoli, one for glucose). It's good to tell these to ode2D so it can check you supplied the right number of variables. 
+
+Finally, note how we just supply the named spatial parameters. deSolve knows to pass these to the function we supplied (monod2D in this case). 
+
+```{r solvemodel}
+## solve model
+# note how we can just supply the named spatial parms
+# we also use Cash-Karp Runge-Kutta method for integration cuz its faster than lsoda
+# 
+# this takes about a minute on a 2022 mid-range desktop
+out = ode.2D(y = yini, times = times, func = monod2D, parms = pars,
+              dimens = c(N, N), nspec = 5, names = c("ecoli", "lactose", "salmonella", "methionine", "acetate"),
+              N = N, D_ecoli = D_ecoli, D_lactose = D_lactose, D_salmonella = D_salmonella, D_methionine = D_methionine, D_acetate = D_acetate, dx = dx, 
+              method = rkMethod("rk45ck"))
+```
+
+Good to check some diagnostics:
+
+Note how we did get some data less than zero, hence the importance of the check in the model function.
+
+```{r checkforcompletion}
+diagnostics(out)
+summary(out)
+```
+
+Then deSolve has a helper function to grab specific state variables, which it returns as a 3d matrix, with the first two dimensions being x and y, and the third dimension being time. Specifically, the times in "times".
+
+```{r getdataout}
+# subset is a deSolve function which grabs single layers for you, 
+# and can return them as arrays
+bacteriaE = subset(out, select = "ecoli", arr = TRUE)
+bacteriaS = subset(out, select = "salmonella", arr = TRUE)
+resourceL = subset(out, select = "lactose", arr = TRUE)
+resourceM = subset(out, select = "methionine", arr = TRUE)
+resourceA = subset(out, select = "acetate", arr = TRUE)
+```
+
+We can do a simple apply function to sum over time and plot:
+
+```{r sumovertime}
+par(mfrow = c(1,2))
+# plot totals through time. margin 3 is time (1 = x, 2 = y)
+total_bacteriaE = apply(bacteriaE, MARGIN = 3, FUN = sum)
+total_bacteriaS = apply(bacteriaS, MARGIN = 3, FUN = sum)
+total_resourceL = apply(resourceL, MARGIN = 3, FUN = sum)
+total_resourceM = apply(resourceM, MARGIN = 3, FUN = sum)
+total_resourceA = apply(resourceA, MARGIN = 3, FUN = sum)
+plot(times, total_bacteriaE)
+plot(times, total_bacteriaS)
+plot(times, total_resourceL)
+plot(times, total_resourceM)
+plot(times, total_resourceA)
+
+```
+
+We can also plot the actual images from select times. Here I do that in a loop.
+The top 6 images are ecoli, the bottom six are glucose. 
+```{r show images, fig.height = 10}
+#A key thing to note here is whether visible nutrient consumption takes place.
+par(mfrow = c(4,3))
+for (i in seq(from = 1, to = 50, length.out = 6)){
+  image(bacteriaE[,,i])
+}
+
+for (i in seq(from = 1, to = 50, length.out = 6)){
+  image(bacteriaS[,,i])
+}
+# and the resource below
+for (i in seq(from = 1, to = 50, length.out = 6)){
+  image(resourceL[,,i])
+}
+for (i in seq(from = 1, to = 50, length.out = 6)){
+  image(resourceM[,,i])
+}
+for (i in seq(from = 1, to = 50, length.out = 6)){
+  image(resourceA[,,i])
+}
+
+```
